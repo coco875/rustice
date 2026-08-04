@@ -1,7 +1,8 @@
 .vscode
 /target
 CEdev
+# Artifacts left by the pre-CEdev-15 build pipeline.
 incremental
+llvm-cbe
 bin
 ti83-fake-linker
-llvm-cbe

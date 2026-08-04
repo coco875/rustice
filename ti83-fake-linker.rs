@@ -1,210 +1,250 @@
-use std::path::Path;
-
-fn create_dirs() {
-    let _ = std::fs::create_dir_all("incremental");
-}
-
-fn patch_asm(file: &str) {
-    let content = std::fs::read_to_string(file).expect("Error reading file");
-    let patched_content = content
-        .replace(".unlikely.", "");
-
-    std::fs::write(file, patched_content).expect("Error writing patched file");
-}
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 fn should_skip_next(arg: &str) -> bool {
     matches!(arg, "-flavor" | "-L" | "-z")
 }
 
 fn ignore(arg: &str) -> bool {
-    if arg.starts_with("-plugin-opt") {
-        return true;
-    }
-    matches!(arg, "--gc-sections" | "--as-needed" | "--eh-frame-hdr" | "--strip-debug" | "-Bstatic" | "-Bdynamic")
+    arg.starts_with("-plugin-opt")
+        || matches!(
+            arg,
+            "--gc-sections"
+                | "--as-needed"
+                | "--eh-frame-hdr"
+                | "--strip-debug"
+                | "-Bstatic"
+                | "-Bdynamic"
+        )
 }
 
-fn run_command(mut cmd: std::process::Command) -> bool {
+fn run(cmd: &mut Command) {
+    println!("Running: {:?}", cmd);
     match cmd.status() {
-        Ok(status) if status.success() => true,
+        Ok(status) if status.success() => {}
         Ok(status) => {
             eprintln!("Command failed with code: {}", status.code().unwrap_or(-1));
-            false
+            std::process::exit(1);
         }
-        Err(e) => {
-            eprintln!("Error executing command: {}", e);
-            false
+        Err(error) => {
+            eprintln!("Error executing command: {error}");
+            std::process::exit(1);
         }
     }
+}
+
+fn tool(root: &Path, parts: &[&str], name: &str) -> PathBuf {
+    let mut path = root.to_path_buf();
+    path.extend(parts);
+    path.push(if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_owned()
+    });
+    path
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let mut iter = args.iter();
+    let mut args = std::env::args().skip(1);
     let mut files = Vec::new();
-    let mut input_c_files = Vec::new();
-    let mut input_bc_files = Vec::new();
-    let mut output = String::new();
-    let elf_name = "output";
-    iter.next(); // Skip program name
-    while let Some(arg) = iter.next() {
-        if should_skip_next(arg) {
-            iter.next();
-            continue;
-        }
-        if ignore(arg) {
-            continue;
-        }
-        if arg == "-o" {
-            if let Some(out) = iter.next() {
-                output = out.clone();
-            }
-            continue;
+    let mut output = None;
+
+    while let Some(arg) = args.next() {
+        if should_skip_next(&arg) {
+            args.next();
+        } else if ignore(&arg) {
+        } else if arg == "-o" {
+            output = args.next().map(PathBuf::from);
         } else {
-            files.push(arg.clone());
+            files.push(PathBuf::from(arg));
         }
     }
-    println!("Files: {:?}, Output: {}", files, output);
-    create_dirs();
 
-    let cedev = std::path::absolute("CEdev").unwrap().to_string_lossy().to_string();
+    let output = output.expect("linker output path was not provided");
+    let output_stem = output
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("output");
+    let program_name: String = output_stem
+        .split('-')
+        .next()
+        .unwrap_or("output")
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .take(8)
+        .collect();
+    let work = output.with_extension("ti83-link");
+    std::fs::create_dir_all(&work).expect("failed to create linker work directory");
 
-    // convert to llvm-ir files
-    for file in &files {
-        if file.ends_with(".o") {
-            let out_file_name = Path::new(file).file_stem().unwrap().to_string_lossy().to_string();
-            if out_file_name == "symbols" {
-                continue; // skip symbols.o
-            }
-            let out_file = format!("incremental/{}.cbe.c", out_file_name);
-            // copy file
-            std::fs::copy(file, &out_file).expect("Erreur lors de la copie du fichier");
-            println!("convert from {} into {}", file, out_file);
-            let mut cmd = std::process::Command::new("./llvm-cbe");
-            cmd.arg(file);
-            cmd.arg("-O3");
-            cmd.arg("-o");
-            cmd.arg(&out_file);
-            if !run_command(cmd) {
-                std::process::exit(1);
-            }
-            input_c_files.push(out_file);
-        } else if file.ends_with(".c") {
-            let out_file = file.to_string();
-            input_c_files.push(out_file);
+    let cedev = std::path::absolute("CEdev").expect("failed to locate CEdev");
+    let clang = tool(&cedev, &["bin"], "ez80-clang");
+    let llvm_link = tool(&cedev, &["bin"], "ez80-link");
+    let cedev_obj = tool(&cedev, &["bin"], "cedev-obj");
+    let assembler = tool(&cedev, &["binutils", "bin"], "z80-none-elf-as");
+    let linker = tool(&cedev, &["binutils", "bin"], "z80-none-elf-ld");
+    let strip = tool(&cedev, &["binutils", "bin"], "z80-none-elf-strip");
+    let convbin = tool(&cedev, &["bin"], "convbin");
+
+    let mut bitcode = Vec::new();
+    for (index, file) in files.iter().enumerate() {
+        if file.file_stem() == Some(OsStr::new("symbols"))
+            || file.to_string_lossy().contains("libcompiler_builtins")
+        {
+            continue;
+        }
+        if file.extension() == Some(OsStr::new("o")) {
+            bitcode.push(file.clone());
+        } else if file.extension() == Some(OsStr::new("c")) {
+            let object = work.join(format!("wrapper-{index}.bc"));
+            run(Command::new(&clang).args([
+                OsStr::new("-c"),
+                OsStr::new("-emit-llvm"),
+                OsStr::new("-Oz"),
+                OsStr::new("-nostdinc"),
+                OsStr::new("-isystem"),
+                cedev.join("include").as_os_str(),
+                OsStr::new("-D__TICE__=1"),
+                OsStr::new("-fno-autolink"),
+                OsStr::new("-fno-addrsig"),
+                OsStr::new("-fno-threadsafe-statics"),
+                OsStr::new("-Xclang"),
+                OsStr::new("-fforce-mangle-main-argc-argv"),
+                file.as_os_str(),
+                OsStr::new("-o"),
+                object.as_os_str(),
+            ]));
+            bitcode.push(object);
         } else {
-            if file.contains("libcompiler_builtins") {
-                println!("skip libcompiler_builtins");
-                continue;
-            }
-            println!("unknown file type: {}", file);
-            std::process::exit(1);
-        };
-        
-    }
-
-    println!("Compile to bc");
-    for name in &input_c_files {
-        let mut cmd = std::process::Command::new(&format!("{}/bin/ez80-clang", cedev));
-        let mut args: Vec<String> = vec![
-            "-c".to_string(),
-            "-emit-llvm".to_string(),
-            "-Wall".to_string(),
-            "-Wextra".to_string(),
-            "-Wno-incompatible-library-redeclaration".to_string(),
-            "-Wno-unused-parameter".to_string(),
-            "-Wno-unused-variable".to_string(),
-            "-Wno-unused-function".to_string(),
-            "-Wno-parentheses-equality".to_string(),
-            "-Wno-unused-but-set-variable".to_string(),
-            "-Oz".to_string(),
-            "-nostdinc".to_string(),
-            "-isystem".to_string(),
-            format!("{}/include", cedev),
-            "-D__TICE__=1".to_string(),
-            "-fno-threadsafe-statics".to_string(),
-            "-Xclang".to_string(),
-            "-fforce-mangle-main-argc-argv".to_string(),
-            "-mllvm".to_string(),
-            "-profile-guided-section-prefix=false".to_string(),
-            name.clone(),
-            "-o".to_string(),
-        ];
-        let output_path = format!("./incremental/{}.bc", Path::new(name).file_stem().unwrap().to_string_lossy());
-        args.push(output_path.clone());
-        cmd.args(&args);
-        if !run_command(cmd) {
+            eprintln!("unknown linker input: {}", file.display());
             std::process::exit(1);
         }
-        input_bc_files.push(output_path);
     }
 
-    let mut cmd = std::process::Command::new(&format!("{}/bin/ez80-link", cedev));
-    let mut args: Vec<String> = Vec::new();
-    args.push("--only-needed".to_string());
-    args.push("--internalize".to_string());
-    for name in input_bc_files {
-        args.push(name);
-    }
-    args.push("-o".to_string());
-    let output_path = format!("./incremental/{}.bc", elf_name);
-    args.push(output_path.clone());
-    cmd.args(&args);
-    if !run_command(cmd) {
-        std::process::exit(1);
-    }
-    
-    println!("Compile to asm");
-    let mut cmd = std::process::Command::new(&format!("{}/bin/ez80-clang", cedev));
-    let mut args = vec![
-        "-S",
-        "-Oz",
+    let linked_bc = work.join("lto.bc");
+    let mut command = Command::new(&llvm_link);
+    command.args(&bitcode).arg("-o").arg(&linked_bc);
+    run(&mut command);
+
+    let assembly = work.join("lto.s");
+    run(Command::new(&clang).args([
+        OsStr::new("-S"),
+        OsStr::new("-Oz"),
+        OsStr::new("-fno-autolink"),
+        OsStr::new("-fno-addrsig"),
+        OsStr::new("-mllvm"),
+        OsStr::new("-z80-gas-style"),
+        linked_bc.as_os_str(),
+        OsStr::new("-o"),
+        assembly.as_os_str(),
+    ]));
+
+    let lto_object = work.join("lto.o");
+    run(Command::new(&assembler)
+        .arg("-march=ez80+full")
+        .arg(&assembly)
+        .arg("-o")
+        .arg(&lto_object));
+
+    let lib = cedev.join("lib");
+    let libraries = [
+        lib.join("libc/allocator_standard.a"),
+        lib.join("crt/libcrt.a"),
+        lib.join("ce/libce.a"),
+        lib.join("softfloat/libsoftfloat.a"),
+        lib.join("libc/libc_os.a"),
     ];
-    args.push(&output_path);
-    args.push("-o");
-    let output_path = format!("./incremental/{}.s", elf_name);
-    args.push(&output_path);
-    cmd.args(&args);
-    if !run_command(cmd) {
-        println!("Fail to create asm");
-        std::process::exit(1);
-    }
-    patch_asm(&output_path);
-    let mut cmd = std::process::Command::new(&format!("{}/bin/fasmg", cedev));
-    cmd.args(&[
-        "-v1",
-        &format!("{}/meta/ld.alm", cedev),
-        "-i", "DEBUG := 1",
-        "-i", "HAS_PRINTF := 1",
-        "-i", "HAS_LIBC := 1",
-        "-i", "HAS_LIBCXX := 0",
-        "-i", "PREFER_OS_CRT := 0",
-        "-i", "PREFER_OS_LIBC := 1",
-        "-i", "ALLOCATOR_STANDARD := 1",
-        "-i", "__TICE__ := 1",
-        "-i", &format!("include '{}/meta/linker_script'", cedev),
-        "-i", "range .bss $D052C6 : $D13FD8",
-        "-i", "provide __stack = $D1A87E",
-        "-i", "locate .header at $D1A87F",
-        "-i", "map",
-        "-i", &format!("source '{}/lib/crt/crt0.src', './incremental/{}.s'", cedev, elf_name),
-        "-i", &format!("library '{}/lib/libload/fatdrvce.lib', '{}/lib/libload/fileioc.lib', '{}/lib/libload/fontlibc.lib', '{}/lib/libload/graphx.lib', '{}/lib/libload/keypadc.lib', '{}/lib/libload/msddrvce.lib', '{}/lib/libload/srldrvce.lib', '{}/lib/libload/usbdrvce.lib'", cedev, cedev, cedev, cedev, cedev, cedev, cedev, cedev),
-        &format!("incremental/{}.bin", elf_name)
-    ]);
-    if !run_command(cmd) {
-        println!("Fail to create bin");
-        std::process::exit(1);
-    }
+    let program_object = work.join("program.o");
+    let mut command = Command::new(&linker);
+    command
+        .args([
+            "-i",
+            "-static",
+            "--entry=__start",
+            "--build-id=none",
+            "--gc-sections",
+            "--omagic",
+        ])
+        .arg("--defsym=__TICE__=1")
+        .arg("--defsym=NDEBUG=1")
+        .arg(&lto_object)
+        .arg("--start-group")
+        .args(&libraries)
+        .arg("--end-group")
+        .arg("-o")
+        .arg(&program_object);
+    run(&mut command);
+    run(Command::new(&strip)
+        .arg("--strip-unneeded")
+        .arg(&program_object));
 
-    let mut cmd = std::process::Command::new(&format!("{}/bin/convbin", cedev));
-    cmd.args(&[
-        "--oformat", "8xp",
-        "--uppercase",
-        "--name", elf_name,
-        "--input", &format!("incremental/{}.bin", elf_name),
-        "--output", &output
-    ]);
-    if !run_command(cmd) {
-        println!("Fail to create 8xp");
-        std::process::exit(1);
+    let crt_header = work.join("crt.h");
+    let mut command = Command::new(&cedev_obj);
+    command
+        .arg("--elf")
+        .arg(&program_object)
+        .arg("--output")
+        .arg(&crt_header)
+        .arg("--libs");
+    for library in [
+        "fatdrvce", "fileioc", "fontlibc", "graphx", "keypadc", "lcddrvce", "msddrvce", "srldrvce",
+        "usbdrvce",
+    ] {
+        command.arg(lib.join(format!("libload/{library}.lib")));
     }
+    run(&mut command);
+
+    let crt_assembly = work.join("crt0.s");
+    run(Command::new(&clang)
+        .arg("-I")
+        .arg(&work)
+        .args(["-E", "-P"])
+        .arg(lib.join("crt/crt0.S"))
+        .arg("-o")
+        .arg(&crt_assembly));
+    let crt_object = work.join("crt0.o");
+    run(Command::new(&assembler)
+        .arg(format!("-I{}", work.display()))
+        .arg("-march=ez80+full")
+        .arg(&crt_assembly)
+        .arg("-o")
+        .arg(&crt_object));
+
+    let executable = work.join("program.obj");
+    let mut command = Command::new(&linker);
+    command
+        .args([
+            "-static",
+            "--entry=__start",
+            "--no-warn-rwx-segments",
+            "--gc-sections",
+            "--omagic",
+        ])
+        .args([
+            "--defsym=LOAD_ADDR=0xD1A87F",
+            "--defsym=BSSHEAP_LOW=0xD052C6",
+            "--defsym=BSSHEAP_HIGH=0xD13FD8",
+            "--defsym=STACK_HIGH=0xD1A87E",
+            "--defsym=__TICE__=1",
+        ])
+        .arg(format!(
+            "-T{}",
+            cedev.join("meta/linker_script.ld").display()
+        ))
+        .arg(format!("-Map={}", work.join("program.map").display()))
+        .arg(&program_object)
+        .arg(&crt_object)
+        .arg("--start-group")
+        .args(&libraries)
+        .arg("--end-group")
+        .arg("-o")
+        .arg(&executable);
+    run(&mut command);
+
+    run(Command::new(&convbin)
+        .args(["-k", "8xp", "-u", "-n", &program_name, "-j", "elf", "-i"])
+        .arg(&executable)
+        .arg("-o")
+        .arg(&output));
 }
